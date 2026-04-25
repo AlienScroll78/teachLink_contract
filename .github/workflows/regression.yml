@@ -1,0 +1,64 @@
+name: Regression Testing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32v1-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # ── Execute tests on commits ──────────────────────────────────────────
+      - name: Run unit tests
+        run: cargo test --workspace --lib 2>&1 | tee test_output.txt
+
+      - name: Run integration tests
+        run: cargo test --workspace --tests 2>&1 | tee -a test_output.txt
+
+      # ── Track performance (gas benchmarks) ───────────────────────────────
+      - name: Run gas benchmarks
+        run: |
+          cargo test --release -p teachlink-contract --test test_gas_benchmarks \
+            -- --nocapture 2>&1 | tee gas_output.txt
+
+      # ── Detect regressions ────────────────────────────────────────────────
+      - name: Check performance regressions
+        run: python3 scripts/check_performance.py
+
+      - name: Build WASM
+        run: cargo build --target wasm32v1-none --release -p teachlink-contract
+
+      - name: Check WASM size
+        run: |
+          WASM=target/wasm32v1-none/release/teachlink_contract.wasm
+          SIZE=$(stat -c%s "$WASM")
+          [ "$SIZE" -gt 307200 ] && echo "FAIL: WASM ${SIZE}B > 300KB" && exit 1
+          echo "WASM size: ${SIZE}B (OK)"
+
+      # ── Generate reports ──────────────────────────────────────────────────
+      - name: Generate report
+        if: always()
+        run: python3 scripts/generate_report.py
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-report-${{ github.run_number }}
+          path: reports/
+
+      - name: Post summary
+        if: always()
+        run: cat reports/summary.md >> "$GITHUB_STEP_SUMMARY"
