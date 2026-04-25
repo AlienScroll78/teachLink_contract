@@ -6,7 +6,9 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  # ── Lint & Format ────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,20 +19,191 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32v1-none
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Check code formatting
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy linter
+      - name: Clippy
         run: cargo clippy --workspace --all-features -- -D warnings
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  build:
+    name: Build WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build WASM (release)
         run: cargo build --target wasm32v1-none --release
 
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-release
+          path: target/wasm32v1-none/release/*.wasm
+          retention-days: 7
+
+  # ── Unit & Integration Tests ─────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Run unit tests
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --lib 2>&1 | tee test-unit.txt
 
       - name: Run integration tests
-        run: cargo test --workspace --test cross_chain_integration
+        run: cargo test --workspace --test '*' 2>&1 | tee test-integration.txt
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            test-unit.txt
+            test-integration.txt
+          retention-days: 14
+
+  # ── Regression Detection ─────────────────────────────────────────────────────
+  regression:
+    name: Regression Tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run gas benchmarks and capture output
+        run: |
+          cargo test --release -p teachlink-contract --test test_gas_benchmarks \
+            -- --nocapture 2>&1 | tee gas_benchmark_output.txt
+
+      - name: Extract gas metrics to gas_current.json
+        run: python3 scripts/run_gas_benchmarks.py --output gas_current.json || true
+
+      - name: Compare against baseline
+        run: python3 scripts/compare_perf_baseline.py
+
+      - name: Upload gas results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gas-results
+          path: |
+            gas_baseline.json
+            gas_current.json
+            gas_benchmark_output.txt
+          retention-days: 30
+
+  # ── Performance Tracking ─────────────────────────────────────────────────────
+  performance:
+    name: Performance Tracking
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check WASM binary size
+        run: |
+          cargo build --target wasm32v1-none --release
+          WASM=$(find target/wasm32v1-none/release -name '*.wasm' | head -1)
+          SIZE=$(stat -c%s "$WASM")
+          echo "wasm_size_bytes=$SIZE" >> "$GITHUB_ENV"
+          echo "WASM size: $SIZE bytes"
+          # Fail if over 300 KB
+          [ "$SIZE" -le 307200 ] || (echo "FAIL: WASM $SIZE bytes > 300 KB limit" && exit 1)
+
+      - name: Run performance tests
+        run: |
+          cargo test --release -p teachlink-contract --test test_performance \
+            -- --nocapture 2>&1 | tee perf-results.txt
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results
+          path: perf-results.txt
+          retention-days: 30
+
+  # ── Report Generation ────────────────────────────────────────────────────────
+  report:
+    name: Generate Report
+    runs-on: ubuntu-latest
+    needs: [test, regression, performance]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ci-artifacts
+
+      - name: Generate summary report
+        run: |
+          mkdir -p testing/reports
+          REPORT=testing/reports/ci-summary.md
+
+          echo "# CI Report — $(date -u '+%Y-%m-%d %H:%M UTC')" > "$REPORT"
+          echo "" >> "$REPORT"
+          echo "| Job | Status |" >> "$REPORT"
+          echo "|-----|--------|" >> "$REPORT"
+          echo "| Tests       | ${{ needs.test.result }} |" >> "$REPORT"
+          echo "| Regression  | ${{ needs.regression.result }} |" >> "$REPORT"
+          echo "| Performance | ${{ needs.performance.result }} |" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Append gas results if available
+          if [ -f ci-artifacts/gas-results/gas_current.json ]; then
+            echo "## Gas Usage" >> "$REPORT"
+            echo '```json' >> "$REPORT"
+            cat ci-artifacts/gas-results/gas_current.json >> "$REPORT"
+            echo '```' >> "$REPORT"
+          fi
+
+          # Append test log tail
+          if [ -f ci-artifacts/test-logs/test-unit.txt ]; then
+            echo "## Unit Test Output (last 30 lines)" >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -30 ci-artifacts/test-logs/test-unit.txt >> "$REPORT"
+            echo '```' >> "$REPORT"
+          fi
+
+          cat "$REPORT"
+
+      - name: Upload CI report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: testing/reports/ci-summary.md
+          retention-days: 30
+
+      - name: Post summary to GitHub Actions
+        run: cat testing/reports/ci-summary.md >> "$GITHUB_STEP_SUMMARY"
