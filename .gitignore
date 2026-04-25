@@ -10,3 +10,4 @@ contracts/teachlink/test_snapshots/
 # Gas benchmark artifacts
 gas_output.txt
 gas_benchmark_report.json
+__pycache__
